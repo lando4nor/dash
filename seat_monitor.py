@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -166,7 +167,22 @@ def load_event(event_id: int, url: str) -> EventInfo:
                      ua(place.get("name")), url)
 
 
-def check_event(cfg: dict, defaults: dict, hall_cache: dict) -> tuple[EventInfo, list[Hit], dict]:
+@dataclass
+class Watch:
+    """Everything about an event that does not change between polls."""
+    info: EventInfo
+    zone: dict[str, Seat]
+    sector: str
+    zone_desc: dict[int, list[str]]
+    max_price: float | None
+    loaded_at: float
+
+
+# Event details and the hall layout are static; reload them once an hour just in case.
+WATCH_TTL = 3600
+
+
+def prepare_event(cfg: dict, defaults: dict, hall_cache: dict) -> Watch:
     event_id = cfg.get("event_id") or resolve_event_id(cfg["url"])
     url = cfg.get("url") or f"https://myr.widget.soldout.ua/event/{event_id}"
     info = load_event(event_id, url)
@@ -181,25 +197,28 @@ def check_event(cfg: dict, defaults: dict, hall_cache: dict) -> tuple[EventInfo,
     width = int(cfg.get("center_seats", defaults.get("center_seats", 20)))
     max_price = cfg.get("max_price", defaults.get("max_price"))
 
-    zone = {s.key: s for r in want_rows for s in central_zone(rows.get((sector, r), []), width)}
+    zones = {r: central_zone(rows.get((sector, r), []), width) for r in want_rows}
+    zone = {s.key: s for seats in zones.values() for s in seats}
+    zone_desc = {r: [s.label for s in seats] for r, seats in zones.items()}
+    return Watch(info, zone, sector, zone_desc, max_price, time.time())
 
-    free = api(f"{READ}/event/client/online/find-all-free-tickets-by-event-id/{event_id}")
+
+def check_event(w: Watch) -> list[Hit]:
+    free = api(f"{READ}/event/client/online/find-all-free-tickets-by-event-id/{w.info.event_id}")
     hits = []
     for t in free:
-        seat = zone.get((t.get("seat") or {}).get("key"))
+        seat = w.zone.get((t.get("seat") or {}).get("key"))
         if not seat:
             continue
         cp = t.get("colorPrice") or {}
         if cp and cp.get("available") is False:
             continue
         price = ticket_price(t)
-        if max_price is not None and price != "?" and float(price) > float(max_price):
+        if w.max_price is not None and price != "?" and float(price) > float(w.max_price):
             continue
         hits.append(Hit(seat.key, seat.row, seat.label, price))
-    hits.sort(key=lambda h: (h.row, zone[h.key].x))
-
-    zone_desc = {r: [s.label for s in central_zone(rows.get((sector, r), []), width)] for r in want_rows}
-    return info, hits, {"sector": sector, "zone": zone_desc}
+    hits.sort(key=lambda h: (h.row, w.zone[h.key].x))
+    return hits
 
 
 # --------------------------------------------------------------------------- telegram
@@ -256,63 +275,87 @@ def _by_row(hits: list[Hit]) -> list[str]:
 
 # --------------------------------------------------------------------------- main loop
 
-def run_once(config: dict, state_path: Path, *, dry_run: bool, verbose: bool, hall_cache: dict) -> int:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-    if not dry_run and not (token and chat_id):
-        sys.exit("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set (or use --dry-run)")
+class Monitor:
+    def __init__(self, config: dict, state_path: Path, *, dry_run: bool, verbose: bool):
+        self.events = config["events"]
+        self.defaults = config.get("defaults", {})
+        self.state_path = state_path
+        self.state = json.loads(state_path.read_text()) if state_path.exists() else {}
+        self.dry_run, self.verbose = dry_run, verbose
+        self.token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+        if not dry_run and not (self.token and self.chat_id):
+            sys.exit("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set (or use --dry-run)")
+        self.hall_cache: dict = {}
+        self.watches: dict[int, Watch] = {}  # index in config["events"] -> Watch
 
-    state = json.loads(state_path.read_text()) if state_path.exists() else {}
-    defaults = config.get("defaults", {})
-    errors = 0
-    for ev in config["events"]:
-        name = ev.get("url") or ev.get("event_id")
-        try:
-            info, hits, meta = check_event(ev, defaults, hall_cache)
-        except Exception as e:  # keep watching the other events
-            errors += 1
-            print(f"[error] {name}: {e}", file=sys.stderr)
-            continue
+    def watch(self, i: int) -> Watch:
+        w = self.watches.get(i)
+        if w is None or time.time() - w.loaded_at > WATCH_TTL:
+            w = self.watches[i] = prepare_event(self.events[i], self.defaults, self.hall_cache)
+            if self.verbose:
+                print(f"{w.info.city or w.info.hall} {w.info.date} (event {w.info.event_id}), sector={w.sector}")
+                for r, labels in w.zone_desc.items():
+                    print(f"    row {r} zone: {', '.join(labels)}")
+        return w
 
-        seen = state.get(str(info.event_id), {})
-        current = {h.key: h.price for h in hits}
-        new = [h for h in hits if h.key not in seen]
-        changed = [(h, seen[h.key]) for h in hits if h.key in seen and seen[h.key] != h.price]
+    def poll(self, *, quiet: bool) -> int:
+        """Check every event once. Returns the number of events that failed."""
+        errors = 0
+        dirty = False
+        for i, ev in enumerate(self.events):
+            try:
+                w = self.watch(i)
+                hits = check_event(w)
+            except Exception as e:  # keep watching the other events
+                errors += 1
+                print(f"[{now()}] error {ev.get('url') or ev.get('event_id')}: {e}", file=sys.stderr)
+                continue
 
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{stamp}] {info.city or info.hall} {info.date} (event {info.event_id}): "
-              f"{len(hits)} free in zone, {len(new)} new, {len(changed)} price changes")
-        if verbose:
-            print(f"    sector={meta['sector']}")
-            for r, labels in meta["zone"].items():
-                print(f"    row {r} zone: {', '.join(labels)}")
-            for line in _by_row(hits):
-                print(f"    free -> {line}")
+            info = w.info
+            seen = self.state.get(str(info.event_id), {})
+            current = {h.key: h.price for h in hits}
+            new = [h for h in hits if h.key not in seen]
+            changed = [(h, seen[h.key]) for h in hits if h.key in seen and seen[h.key] != h.price]
 
-        if new or changed:
-            msg = format_message(info, new, changed, hits)
-            if dry_run:
-                print("---- telegram (dry run) ----\n" + msg + "\n---------------------------")
-            else:
-                try:
-                    tg_send(token, chat_id, msg)
-                except Exception as e:
-                    # Keep the old state so the same seats are reported on the next run.
-                    errors += 1
-                    print(f"[error] telegram: {e}", file=sys.stderr)
-                    continue
-        # Seats that disappeared are forgotten, so they are reported again if they come back.
-        state[str(info.event_id)] = current
+            if not quiet or new or changed or current != seen:
+                print(f"[{now()}] {info.city or info.hall} {info.date}: "
+                      f"{len(hits)} free in zone, {len(new)} new, {len(changed)} price changes")
+                for line in _by_row(hits) if self.verbose else []:
+                    print(f"    free -> {line}")
 
-    state_path.write_text(json.dumps(state, indent=1, ensure_ascii=False))
-    return errors
+            if new or changed:
+                msg = format_message(info, new, changed, hits)
+                if self.dry_run:
+                    print("---- telegram (dry run) ----\n" + msg + "\n---------------------------")
+                else:
+                    try:
+                        tg_send(self.token, self.chat_id, msg)
+                    except Exception as e:
+                        # Keep the old state so the same seats are reported on the next poll.
+                        errors += 1
+                        print(f"[{now()}] error telegram: {e}", file=sys.stderr)
+                        continue
+            # Seats that disappeared are forgotten, so they are reported again if they come back.
+            if current != seen:
+                self.state[str(info.event_id)] = current
+                dirty = True
+
+        if dirty or not self.state_path.exists():
+            self.state_path.write_text(json.dumps(self.state, indent=1, ensure_ascii=False))
+        return errors
+
+
+def now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", default="config.json")
     ap.add_argument("--state", default="state.json", help="remembers already reported seats")
-    ap.add_argument("--loop", type=int, metavar="SECONDS", help="keep running, checking every N seconds")
+    ap.add_argument("--loop", type=float, metavar="SECONDS", help="keep running, checking every N seconds")
+    ap.add_argument("--duration", type=float, metavar="SECONDS", help="with --loop: stop after this long")
     ap.add_argument("--dry-run", action="store_true", help="print messages instead of sending to Telegram")
     ap.add_argument("-v", "--verbose", action="store_true", help="show the centre zone and free seats")
     ap.add_argument("--get-chat-id", action="store_true", help="print chat ids that wrote to the bot")
@@ -328,13 +371,26 @@ def main() -> None:
         return
 
     config = json.loads(Path(args.config).read_text())
-    state_path = Path(args.state)
-    hall_cache: dict = {}
-    while True:
-        errors = run_once(config, state_path, dry_run=args.dry_run, verbose=args.verbose, hall_cache=hall_cache)
-        if not args.loop:
-            sys.exit(1 if errors == len(config["events"]) else 0)
-        time.sleep(args.loop)
+    mon = Monitor(config, Path(args.state), dry_run=args.dry_run, verbose=args.verbose)
+    if not args.loop:
+        errors = mon.poll(quiet=False)
+        sys.exit(1 if errors == len(config["events"]) else 0)
+
+    deadline = time.time() + args.duration if args.duration else None
+    failures = 0       # consecutive polls where every event failed
+    last_report = 0.0
+    while deadline is None or time.time() < deadline:
+        # Print a status line every 10 minutes; otherwise only when something changes.
+        report = time.time() - last_report > 600
+        errors = mon.poll(quiet=not report)
+        if report:
+            last_report = time.time()
+        failures = failures + 1 if errors == len(config["events"]) else 0
+        # Back off when the site is down or rate-limiting us, up to 5 minutes.
+        delay = min(args.loop * 2 ** failures, 300) if failures else args.loop
+        # A little jitter so requests do not land on an exact beat.
+        time.sleep(delay * random.uniform(0.85, 1.15))
+    print(f"[{now()}] --duration reached, exiting")
 
 
 if __name__ == "__main__":
