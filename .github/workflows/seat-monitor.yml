@@ -1,0 +1,40 @@
+name: seat-monitor
+
+# One job polls the API every 15 seconds for ~5h40m (a job may run at most 6h).
+# The hourly schedule keeps the next run queued behind the running one (see concurrency),
+# so it starts as soon as the previous one exits and there is no gap in coverage.
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: seat-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      # state.json remembers which seats were already reported, so a new run does not
+      # repeat them. It lives in the Actions cache between runs.
+      - uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: seat-state-${{ github.run_id }}
+          restore-keys: seat-state-
+
+      - name: Watch seats
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 -u seat_monitor.py -v --loop 15 --duration 20400
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state.json
+          key: seat-state-${{ github.run_id }}-${{ github.run_attempt }}
