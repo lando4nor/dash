@@ -1,0 +1,31 @@
+{
+  "defaults": {
+    "rows": [
+      1,
+      2,
+      3
+    ],
+    "center_seats": 20,
+    "max_price": null
+  },
+  "events": [
+    {
+      "url": "https://myr.com.ua/events/nowa-wistawa-graj-marku-started-on-11-18-2026/tickets",
+      "event_id": 2437,
+      "center_seats": 12,
+      "_comment": "Чернигов: в первых рядах всего 24-30 мест, поэтому центр уже"
+    },
+    {
+      "url": "https://myr.com.ua/events/nowa-wistawa-graj-marku-started-on-11-20-2026/tickets",
+      "event_id": 2438
+    },
+    {
+      "url": "https://myr.com.ua/events/nowa-wistawa-graj-marku-started-on-12-09-2026/tickets",
+      "event_id": 2439
+    },
+    {
+      "url": "https://myr.com.ua/events/nowa-wistawa-graj-marku-started-on-12-13-2026/tickets",
+      "event_id": 2424
+    }
+  ]
+}

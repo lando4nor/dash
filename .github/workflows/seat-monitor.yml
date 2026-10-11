@@ -1,0 +1,37 @@
+name: seat-monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # GitHub may delay scheduled runs by a few minutes
+  workflow_dispatch:
+
+concurrency:
+  group: seat-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # state.json remembers which seats were already reported, so you are not spammed
+      # every 5 minutes about the same seats. It lives in the Actions cache between runs.
+      - uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: seat-state-${{ github.run_id }}
+          restore-keys: seat-state-
+
+      - name: Check seats
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 seat_monitor.py -v
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state.json
+          key: seat-state-${{ github.run_id }}-${{ github.run_attempt }}
