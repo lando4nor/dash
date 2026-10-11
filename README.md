@@ -56,6 +56,7 @@ python3 seat_monitor.py --dry-run -v          # показать зону цен
 export TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...
 python3 seat_monitor.py --test-telegram       # проверить, что сообщения доходят
 python3 seat_monitor.py --loop 15             # проверять каждые 15 секунд
+python3 seat_monitor.py --loop 15 --log-polls # то же, но писать строку в лог после каждого опроса
 ```
 
 ## Важно
