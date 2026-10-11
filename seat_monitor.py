@@ -276,12 +276,13 @@ def _by_row(hits: list[Hit]) -> list[str]:
 # --------------------------------------------------------------------------- main loop
 
 class Monitor:
-    def __init__(self, config: dict, state_path: Path, *, dry_run: bool, verbose: bool):
+    def __init__(self, config: dict, state_path: Path, *, dry_run: bool, verbose: bool, log_polls: bool = False):
         self.events = config["events"]
         self.defaults = config.get("defaults", {})
         self.state_path = state_path
         self.state = json.loads(state_path.read_text()) if state_path.exists() else {}
-        self.dry_run, self.verbose = dry_run, verbose
+        self.dry_run, self.verbose, self.log_polls = dry_run, verbose, log_polls
+        self.polls = 0
         self.token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
         if not dry_run and not (self.token and self.chat_id):
@@ -303,16 +304,20 @@ class Monitor:
         """Check every event once. Returns the number of events that failed."""
         errors = 0
         dirty = False
+        started = time.time()
+        summary = []  # one "city: N" per event, for --log-polls
         for i, ev in enumerate(self.events):
             try:
                 w = self.watch(i)
                 hits = check_event(w)
             except Exception as e:  # keep watching the other events
                 errors += 1
+                summary.append(f"{ev.get('event_id') or '?'}: ERROR")
                 print(f"[{now()}] error {ev.get('url') or ev.get('event_id')}: {e}", file=sys.stderr)
                 continue
 
             info = w.info
+            summary.append(f"{info.city or info.hall} {info.date[5:10]}: {len(hits)}")
             seen = self.state.get(str(info.event_id), {})
             current = {h.key: h.price for h in hits}
             new = [h for h in hits if h.key not in seen]
@@ -343,6 +348,9 @@ class Monitor:
 
         if dirty or not self.state_path.exists():
             self.state_path.write_text(json.dumps(self.state, indent=1, ensure_ascii=False))
+        self.polls += 1
+        if self.log_polls:
+            print(f"[{now()}] poll #{self.polls} ({time.time() - started:.1f}s), free in zone: {' | '.join(summary)}")
         return errors
 
 
@@ -358,6 +366,7 @@ def main() -> None:
     ap.add_argument("--duration", type=float, metavar="SECONDS", help="with --loop: stop after this long")
     ap.add_argument("--dry-run", action="store_true", help="print messages instead of sending to Telegram")
     ap.add_argument("-v", "--verbose", action="store_true", help="show the centre zone and free seats")
+    ap.add_argument("--log-polls", action="store_true", help="log a one-line summary after every poll")
     ap.add_argument("--get-chat-id", action="store_true", help="print chat ids that wrote to the bot")
     ap.add_argument("--test-telegram", action="store_true", help="send a test message and exit")
     args = ap.parse_args()
@@ -371,7 +380,7 @@ def main() -> None:
         return
 
     config = json.loads(Path(args.config).read_text())
-    mon = Monitor(config, Path(args.state), dry_run=args.dry_run, verbose=args.verbose)
+    mon = Monitor(config, Path(args.state), dry_run=args.dry_run, verbose=args.verbose, log_polls=args.log_polls)
     if not args.loop:
         errors = mon.poll(quiet=False)
         sys.exit(1 if errors == len(config["events"]) else 0)
